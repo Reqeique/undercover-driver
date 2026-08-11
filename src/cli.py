@@ -13,8 +13,10 @@ back into an LLM; use --pretty for a human-readable rendering.
 
 Usage:
 
-    export BROWSER_URL=http://localhost:4321          # server base URL
-    export BROWSER_TOKEN=secret                       # Bearer token (optional)
+    export APIFY_TOKEN=<apify-api-token>     # auto-resolves BROWSER_URL + auth
+    # or explicitly:
+    export BROWSER_URL=http://localhost:4321  # session server base URL
+    export BROWSER_TOKEN=secret               # Bearer token (optional)
 
     python -m src.cli health
     python -m src.cli status
@@ -58,6 +60,49 @@ def _fatal(msg: str) -> "NoReturn":
     raise _CliError(msg)
 
 DEFAULT_URL = "http://localhost:4321"
+DEFAULT_ACTOR_ID = "pHO5Yrhfzq7ZCu5Fy"
+
+
+# ---------------------------------------------------------------------------
+# session URL resolution (Apify API)
+# ---------------------------------------------------------------------------
+
+def _actor_id(args: argparse.Namespace) -> str:
+    return (args.actor_id or os.environ.get("APIFY_ACTOR_ID") or DEFAULT_ACTOR_ID)
+
+
+def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Find the containerUrl of the most recent RUNNING run of the actor.
+
+    Uses the Apify API with the token from --token / BROWSER_TOKEN /
+    APIFY_TOKEN.  Returns (url, None) on success, (None, error) otherwise.
+    """
+    tok = _apify_token(args)
+    if not tok:
+        return None, "no token; set APIFY_TOKEN or BROWSER_TOKEN (or pass --token) to auto-resolve BROWSER_URL"
+    actor = _actor_id(args)
+    api_headers = {"Accept": "application/json", "Authorization": f"Bearer {tok}"}
+
+    list_url = f"https://api.apify.com/v2/actors/{actor}/runs?desc=1&limit=5"
+    status, resp = _http("GET", list_url, api_headers)
+    if status != 200:
+        return None, f"could not list actor runs (HTTP {status}): {str(resp)[:300]}"
+
+    for item in resp.get("data", {}).get("items", []):
+        if item.get("status") != "RUNNING":
+            continue
+        rid = item.get("id")
+        for detail_url in (
+            f"https://api.apify.com/v2/actor-runs/{rid}",
+            f"https://api.apify.com/v2/actors/{actor}/runs/{rid}",
+        ):
+            dstatus, dresp = _http("GET", detail_url, api_headers)
+            if dstatus != 200:
+                continue
+            cu = dresp.get("data", {}).get("containerUrl")
+            if cu:
+                return cu.rstrip("/"), None
+    return None, f"no RUNNING run found for actor {actor} (start one, then retry)"
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +115,15 @@ def _base_url(args: argparse.Namespace) -> str:
 
 def _token(args: argparse.Namespace) -> str:
     return args.token or os.environ.get("BROWSER_TOKEN") or os.environ.get("APIFY_TOKEN") or ""
+
+
+def _apify_token(args: argparse.Namespace) -> str:
+    """Token for Apify API calls (resolution) — prefers the real API token.
+
+    The session bearer (BROWSER_TOKEN) is often a per-run auth_token that the
+    Apify API would reject, so resolution only uses it as a last resort.
+    """
+    return (os.environ.get("APIFY_TOKEN") or args.token or os.environ.get("BROWSER_TOKEN") or "")
 
 
 def _headers(args: argparse.Namespace, json_body: bool = False) -> dict[str, str]:
@@ -228,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--url", help=f"session server base URL (env BROWSER_URL, default {DEFAULT_URL})")
     parser.add_argument("--token", help="Bearer token (env BROWSER_TOKEN or APIFY_TOKEN)")
+    parser.add_argument("--actor-id", help=f"Apify actor ID to auto-resolve BROWSER_URL (env APIFY_ACTOR_ID, default {DEFAULT_ACTOR_ID})")
     parser.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
 
@@ -304,6 +359,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if not (args.url or os.environ.get("BROWSER_URL")):
+            url, err = _resolve_browser_url(args)
+            if url:
+                args.url = url
+                print(f"auto-resolved BROWSER_URL: {url}", file=sys.stderr)
+            elif err:
+                print(f"warning: {err}", file=sys.stderr)
         return int(args.func(args))
     except _CliError as e:
         print(f"error: {e}", file=sys.stderr)

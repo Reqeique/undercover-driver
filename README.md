@@ -55,6 +55,22 @@ undercover-driver verify_cf
 undercover-driver close
 ```
 
+### Auto-resolved URL
+
+`BROWSER_URL` is optional. With an Apify API token, the CLI finds the most
+recent **RUNNING** run of the actor and uses its container URL automatically:
+
+```sh
+export APIFY_TOKEN=<apify-api-token>      # used to resolve the session URL
+export BROWSER_TOKEN=<session-auth-token> # bearer for the session (same as
+                                          # APIFY_TOKEN if the run started with
+                                          # no custom auth_token)
+undercover-driver goto https://example.com
+```
+
+Override with `BROWSER_URL` / `--url`, or point at a different actor with
+`APIFY_ACTOR_ID` / `--actor-id` (default: the Stealth Browser Agent actor).
+
 Or run from source:
 
 ```sh
