@@ -115,6 +115,7 @@ def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | No
 
 RUN_START_TIMEOUT_S = 300.0
 RUN_POLL_INTERVAL_S = 5.0
+RUN_MEMORY_MB = 2048  # smallest Apify power-of-2 tier above observed ~1.3 GB max usage
 
 
 def _start_server_run(args: argparse.Namespace, actor: str, tok: str) -> tuple[str | None, str | None]:
@@ -136,7 +137,7 @@ def _start_server_run(args: argparse.Namespace, actor: str, tok: str) -> tuple[s
         "Content-Type": "application/json",
         "Authorization": f"Bearer {tok}",
     }
-    start_url = f"https://api.apify.com/v2/actors/{actor}/runs"
+    start_url = f"https://api.apify.com/v2/actors/{actor}/runs?memory={RUN_MEMORY_MB}"
     try:
         status, resp = _http("POST", start_url, headers, json.dumps(payload).encode("utf-8"))
     except _CliError as e:
