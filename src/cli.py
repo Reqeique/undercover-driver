@@ -13,7 +13,7 @@ back into an LLM; use --pretty for a human-readable rendering.
 
 Usage:
 
-    export APIFY_TOKEN=<apify-api-token>     # auto-resolves BROWSER_URL + auth
+    export APIFY_TOKEN=<apify-api-token>     # auto-resolves BROWSER_URL, starts a session if none is running, + auth
     # or explicitly:
     export BROWSER_URL=http://localhost:4321  # session server base URL
     export BROWSER_TOKEN=secret               # Bearer token (optional)
@@ -47,6 +47,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any, NoReturn
@@ -74,8 +75,9 @@ def _actor_id(args: argparse.Namespace) -> str:
 def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | None]:
     """Find the containerUrl of the most recent RUNNING run of the actor.
 
-    Uses the Apify API with the token from --token / BROWSER_TOKEN /
-    APIFY_TOKEN.  Returns (url, None) on success, (None, error) otherwise.
+    If no run is RUNNING, starts a fresh server run and waits for its
+    container URL (unless --no-autostart).  Returns (url, None) on success,
+    (None, error) otherwise.
     """
     tok = _apify_token(args)
     if not tok:
@@ -84,7 +86,10 @@ def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | No
     api_headers = {"Accept": "application/json", "Authorization": f"Bearer {tok}"}
 
     list_url = f"https://api.apify.com/v2/actors/{actor}/runs?desc=1&limit=5"
-    status, resp = _http("GET", list_url, api_headers)
+    try:
+        status, resp = _http("GET", list_url, api_headers)
+    except _CliError as e:
+        return None, str(e)
     if status != 200:
         return None, f"could not list actor runs (HTTP {status}): {str(resp)[:300]}"
 
@@ -102,7 +107,66 @@ def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | No
             cu = dresp.get("data", {}).get("containerUrl")
             if cu:
                 return cu.rstrip("/"), None
-    return None, f"no RUNNING run found for actor {actor} (start one, then retry)"
+
+    if getattr(args, "no_autostart", False) or os.environ.get("AB_NO_AUTOSTART") == "1":
+        return None, f"no RUNNING run found for actor {actor} (--no-autostart; start one, then retry)"
+    return _start_server_run(args, actor, tok)
+
+
+RUN_START_TIMEOUT_S = 300.0
+RUN_POLL_INTERVAL_S = 5.0
+
+
+def _start_server_run(args: argparse.Namespace, actor: str, tok: str) -> tuple[str | None, str | None]:
+    """Start a fresh server run for the actor and wait for its container URL.
+
+    The new run's auth_token is the CLI's session bearer token (_token), so a
+    single token authenticates both the API and the session.
+    """
+    session_token = _token(args) or tok
+    payload = {
+        "mode": "server",
+        "backend": "zendriver",
+        "proxy_country": "US",
+        "idle_timeout_s": 3600,
+        "auth_token": session_token,
+    }
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {tok}",
+    }
+    start_url = f"https://api.apify.com/v2/actors/{actor}/runs"
+    try:
+        status, resp = _http("POST", start_url, headers, json.dumps(payload).encode("utf-8"))
+    except _CliError as e:
+        return None, str(e)
+    if status not in (200, 201):
+        return None, f"could not start actor run (HTTP {status}): {str(resp)[:300]}"
+    rid = resp.get("data", {}).get("id")
+    if not rid:
+        return None, "started run but got no run id back"
+
+    print(f"started new session run {rid} for actor {actor} (waiting for container URL)", file=sys.stderr)
+    poll_headers = {"Accept": "application/json", "Authorization": f"Bearer {tok}"}
+    deadline = time.monotonic() + RUN_START_TIMEOUT_S
+    while time.monotonic() < deadline:
+        time.sleep(RUN_POLL_INTERVAL_S)
+        try:
+            dstatus, dresp = _http("GET", f"https://api.apify.com/v2/actor-runs/{rid}", poll_headers)
+        except _CliError as e:
+            return None, str(e)
+        if dstatus != 200:
+            continue
+        d = dresp.get("data", {})
+        st = d.get("status")
+        cu = d.get("containerUrl")
+        if cu:
+            return cu.rstrip("/"), None
+        if st in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED_OUT"):
+            return None, f"new run {rid} exited with status {st} before a session URL was available"
+        print(f"  waiting for run {rid} (status {st})...", file=sys.stderr)
+    return None, f"timed out waiting for run {rid} to become RUNNING"
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", help=f"session server base URL (env BROWSER_URL, default {DEFAULT_URL})")
     parser.add_argument("--token", help="Bearer token (env BROWSER_TOKEN or APIFY_TOKEN)")
     parser.add_argument("--actor-id", help=f"Apify actor ID to auto-resolve BROWSER_URL (env APIFY_ACTOR_ID, default {DEFAULT_ACTOR_ID})")
+    parser.add_argument("--no-autostart", action="store_true",
+                        help="if no RUNNING run exists, fail instead of starting a new one")
     parser.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
     parser.add_argument("--timeout", type=float, default=60.0, help="HTTP timeout in seconds")
 
