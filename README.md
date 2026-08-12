@@ -20,7 +20,7 @@ GET  /health     readiness + current page status
 
 Every subcommand maps 1:1 to the server's command surface: `status`, `snapshot`,
 `goto`, `wait`, `click`, `fill`, `type`, `press`, `select`, `eval`, `text`,
-`links`, `screenshot`, `verify_cf`, `close`.
+`links`, `screenshot`, `verify_cf`, `vnc`, `close`.
 
 ## Install (one line)
 
@@ -54,6 +54,24 @@ undercover-driver fill @e4 "hi@example.com"
 undercover-driver verify_cf
 undercover-driver close
 ```
+
+### Manual logins via noVNC (`vnc`)
+
+Some flows (Google login, CAPTCHA-on-login pages) are easier done by hand.
+`vnc` prints the noVNC viewer URL of the running session; `--start` boots a
+new **VNC-enabled** session (`vnc=true`, cloak backend) if nothing is
+running, and can pin a persistent R2 profile so the login survives future
+runs:
+
+```sh
+undercover-driver vnc                                   # URL of the live viewer
+undercover-driver vnc --start                            # start a VNC session
+undercover-driver vnc --start --session-name google      # persist profile as "google"
+undercover-driver vnc --start --backend zendriver        # pick the backend
+```
+
+The session server behind it must have `vnc=true`; the URL points at
+`/vnc` on the container. Viewers are plain noVNC — no extra install.
 
 ### Auto-resolved URL
 
