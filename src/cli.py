@@ -72,12 +72,14 @@ def _actor_id(args: argparse.Namespace) -> str:
     return (args.actor_id or os.environ.get("APIFY_ACTOR_ID") or DEFAULT_ACTOR_ID)
 
 
-def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | None]:
+def _resolve_browser_url(args: argparse.Namespace,
+                         extra_input: dict[str, Any] | None = None) -> tuple[str | None, str | None]:
     """Find the containerUrl of the most recent RUNNING run of the actor.
 
     If no run is RUNNING, starts a fresh server run and waits for its
     container URL (unless --no-autostart).  Returns (url, None) on success,
-    (None, error) otherwise.
+    (None, error) otherwise.  `extra_input` is merged into the run input when
+    a new session has to be started.
     """
     tok = _apify_token(args)
     if not tok:
@@ -110,7 +112,7 @@ def _resolve_browser_url(args: argparse.Namespace) -> tuple[str | None, str | No
 
     if getattr(args, "no_autostart", False) or os.environ.get("AB_NO_AUTOSTART") == "1":
         return None, f"no RUNNING run found for actor {actor} (--no-autostart; start one, then retry)"
-    return _start_server_run(args, actor, tok)
+    return _start_server_run(args, actor, tok, extra_input=extra_input)
 
 
 RUN_START_TIMEOUT_S = 300.0
@@ -118,11 +120,13 @@ RUN_POLL_INTERVAL_S = 5.0
 RUN_MEMORY_MB = 2048  # smallest Apify power-of-2 tier above observed ~1.3 GB max usage
 
 
-def _start_server_run(args: argparse.Namespace, actor: str, tok: str) -> tuple[str | None, str | None]:
+def _start_server_run(args: argparse.Namespace, actor: str, tok: str,
+                      extra_input: dict[str, Any] | None = None) -> tuple[str | None, str | None]:
     """Start a fresh server run for the actor and wait for its container URL.
 
     The new run's auth_token is the CLI's session bearer token (_token), so a
-    single token authenticates both the API and the session.
+    single token authenticates both the API and the session. `extra_input` is
+    merged on top of the default payload (e.g. vnc=true, session_name=...).
     """
     session_token = _token(args) or tok
     payload = {
@@ -132,6 +136,8 @@ def _start_server_run(args: argparse.Namespace, actor: str, tok: str) -> tuple[s
         "idle_timeout_s": 3600,
         "auth_token": session_token,
     }
+    if extra_input:
+        payload.update(extra_input)
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
@@ -255,6 +261,24 @@ def _cmd_health(args: argparse.Namespace) -> int:
         raise _CliError(f"server returned HTTP {status}: {json.dumps(resp)[:500]}")
     _emit(args, {"ok": True, **resp})
     return 0
+
+
+def _cmd_vnc(args: argparse.Namespace) -> int:
+    base = _base_url(args)
+    vnc_url = f"{base}/vnc.html?autoconnect=true&path=/websockify&resize=scale"
+    status = 0
+    resp: dict[str, Any] = {}
+    try:
+        sc, body = _http("GET", f"{base}/vnc.html", _headers(args))
+        if sc != 200:
+            resp["warning"] = f"noVNC viewer returned HTTP {sc}; is the session started with vnc=true?"
+            status = 0
+    except _CliError as e:
+        resp["warning"] = str(e)
+    _emit(args, {"ok": True, "url": vnc_url, **resp})
+    if not args.pretty:
+        print(vnc_url)
+    return status
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -419,6 +443,20 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("close", help="shut down the session server")
     p.set_defaults(func=_cmd_close)
 
+    p = sub.add_parser(
+        "vnc",
+        help="open the noVNC in-browser viewer for manual multi-step logins (Google, etc.)",
+    )
+    p.add_argument("--start", action="store_true",
+                   help="if no session is running, start one with vnc=true (cloak backend by default)")
+    p.add_argument("--session-name", metavar="NAME",
+                   help="with --start: persist this profile to R2 under this name (implies persist=true)")
+    p.add_argument("--persist", action="store_true",
+                   help="with --start: persist the profile to R2 even without a session name")
+    p.add_argument("--backend", default="cloak", choices=("cloak", "zendriver"),
+                   help="with --start: browser backend (default cloak - headed, ideal for VNC)")
+    p.set_defaults(func=_cmd_vnc)
+
     return parser
 
 
@@ -427,7 +465,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if not (args.url or os.environ.get("BROWSER_URL")):
-            url, err = _resolve_browser_url(args)
+            extra = None
+            if getattr(args, "command", None) == "vnc" and getattr(args, "start", False):
+                extra = {"vnc": True, "backend": getattr(args, "backend", "cloak")}
+                sn = getattr(args, "session_name", None)
+                if sn:
+                    extra["session_name"] = sn
+                    extra["persist"] = True
+                elif getattr(args, "persist", False):
+                    extra["persist"] = True
+            url, err = _resolve_browser_url(args, extra)
             if url:
                 args.url = url
                 print(f"auto-resolved BROWSER_URL: {url}", file=sys.stderr)
